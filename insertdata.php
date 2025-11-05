@@ -3,7 +3,7 @@
 
 include "db.php";
 
-$api_key_value = "NfkoenKmg97m";
+$api_key_value = "xxxxx";
 
 if ($_SERVER["REQUEST_METHOD"] == "GET") {
     $_POST = $_GET; // För test
@@ -135,3 +135,4 @@ function test_input($data) {
 function generatePin() {
     return rand(1000, 9999);
 }
+
