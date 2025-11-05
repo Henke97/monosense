@@ -1,0 +1,177 @@
+// Heltec WiFi LoRa 32 V3.2 – OTAA uplink med AHT30 + OLED
+#include "LoRaWan_APP.h"
+#include <Wire.h>
+#include <Adafruit_AHTX0.h>
+#include <Adafruit_SSD1306.h>
+
+#define VBAT_ADC   1      // GPIO1 → ADC1_CH0 = Battery
+#define ADC_CTRL   37     // GPIO37 → ADC Control
+
+// --- OTAA parametrar från TTN ---
+uint8_t devEui[] = {xxx };
+uint8_t appEui[] = { xxx };
+uint8_t appKey[] = { xxx };
+
+// --- ABP dummy (krävs av Heltec stacken även i OTAA) ---
+uint32_t devAddr = (uint32_t)0x00000000;
+uint8_t nwkSKey[16] = { 0 };
+uint8_t appSKey[16] = { 0 };
+
+// Krävs alltid i Heltecs stack
+uint16_t userChannelsMask[6] = { xxxxx,0,0,0,0,0 };
+
+// LoRaWAN setup
+LoRaMacRegion_t loraWanRegion = LORAMAC_REGION_EU868;
+DeviceClass_t  loraWanClass   = CLASS_A;
+bool overTheAirActivation = true;
+bool loraWanAdr = true;
+bool isTxConfirmed = true;
+uint8_t appPort = 2;
+uint8_t confirmedNbTrials = 4;
+
+// Uplink intervall
+uint32_t appTxDutyCycle = 60000;     // 60 sek test
+
+// ---- AHT30 & OLED ----
+Adafruit_AHTX0 aht;
+Adafruit_SSD1306 display(128, 64, &Wire, -1);
+
+float lastTemp = 0, lastHum = 0;
+uint16_t lastVbat = 0;
+
+// ---------------- Batterimätning ----------------
+uint16_t readVBAT() {
+  digitalWrite(ADC_CTRL, HIGH);
+  delay(5);
+  int raw = analogRead(VBAT_ADC);
+  float v_meas = (raw / 4095.0) * 3.3;
+  float v_bat  = v_meas * 4.9;
+  digitalWrite(ADC_CTRL, LOW);
+  return (uint16_t)(v_bat * 1000);
+}
+
+// ---------------- Payload ----------------
+static void prepareTxFrame(uint8_t port) {
+  // Batteri
+  lastVbat = readVBAT();
+
+  // AHT30
+  sensors_event_t humidity, temp;
+  aht.getEvent(&humidity, &temp);
+  lastTemp = temp.temperature;
+  lastHum  = humidity.relative_humidity;
+
+  // Payload = VBAT (mV), Temp (cC), Hum (%c)
+  uint16_t t_enc = (int16_t)(lastTemp * 100);   // 2 dec
+  uint16_t h_enc = (int16_t)(lastHum * 100);    // 2 dec
+
+  appDataSize = 6;
+  appData[0] = highByte(lastVbat);
+  appData[1] = lowByte(lastVbat);
+  appData[2] = highByte(t_enc);
+  appData[3] = lowByte(t_enc);
+  appData[4] = highByte(h_enc);
+  appData[5] = lowByte(h_enc);
+
+  Serial.printf("Payload: Vbat=%.3fV, Temp=%.2f°C, Hum=%.2f%%\n",
+                lastVbat/1000.0, lastTemp, lastHum);
+}
+
+// ---------------- OLED ----------------
+void showOLED(const char* status) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(0, 0);
+  display.printf("LoRa32 V3.2 OTAA\n");
+
+  display.setCursor(0, 12);
+  display.printf("Status: %s\n", status);
+
+  display.setCursor(0, 28);
+  display.printf("Vbat: %.2f V\n", lastVbat/1000.0);
+
+  display.setCursor(0, 40);
+  display.printf("T: %.2f C\n", lastTemp);
+
+  display.setCursor(0, 52);
+  display.printf("RH: %.2f %%\n", lastHum);
+
+  display.display();
+}
+
+// ---------------- Setup ----------------
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  Mcu.begin(HELTEC_BOARD, SLOW_CLK_TPYE);
+  pinMode(ADC_CTRL, OUTPUT);
+  digitalWrite(ADC_CTRL, LOW);
+
+  // I2C bus för AHT30 (47/48) & OLED (17/18)
+  Wire.begin(47, 48);
+  if (!aht.begin()) {
+    Serial.println("AHT30 not found!");
+  }
+
+  Wire.begin(17, 18);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("OLED not found!");
+  } else {
+    showOLED("Booting...");
+  }
+
+  deviceState = DEVICE_STATE_INIT;
+}
+
+// ---------------- Loop ----------------
+void loop() {
+  switch (deviceState) {
+    case DEVICE_STATE_INIT: {
+      LoRaWAN.init(loraWanClass, loraWanRegion);
+      LoRaWAN.setDefaultDR(3);
+      Serial.println("LoRaWAN stack init (OTAA)");
+      showOLED("Init LoRaWAN");
+      deviceState = DEVICE_STATE_JOIN;
+      break;
+    }
+
+    case DEVICE_STATE_JOIN: {
+      Serial.println("Försöker OTAA-join...");
+      showOLED("Joining...");
+      LoRaWAN.join();
+      break;
+    }
+
+    case DEVICE_STATE_SEND: {
+      Serial.println("Skickar uplink...");
+      prepareTxFrame(appPort);
+      LoRaWAN.send();
+      showOLED("Uplink sent");
+      deviceState = DEVICE_STATE_CYCLE;
+      break;
+    }
+
+    case DEVICE_STATE_CYCLE: {
+      txDutyCycleTime = appTxDutyCycle +
+                        randr(-APP_TX_DUTYCYCLE_RND, APP_TX_DUTYCYCLE_RND);
+      Serial.printf("⏳ Nästa uplink om ~%lu ms\n", txDutyCycleTime);
+      showOLED("Sleeping...");
+      LoRaWAN.cycle(txDutyCycleTime);
+      deviceState = DEVICE_STATE_SLEEP;
+      break;
+    }
+
+    case DEVICE_STATE_SLEEP: {
+      LoRaWAN.sleep(loraWanClass);
+      break;
+    }
+
+    default: {
+      deviceState = DEVICE_STATE_INIT;
+      break;
+    }
+  }
+}
