@@ -3,7 +3,7 @@
 
 include "db.php";
 
-$api_key_value = "NfkoenKmg97m";
+$api_key_value = "xxxx";
 
 // --- Läs in inkommande JSON ---
 $raw = file_get_contents("php://input");
@@ -148,3 +148,4 @@ function generatePin() {
     return rand(1000, 9999);
 }
 ?>
+
