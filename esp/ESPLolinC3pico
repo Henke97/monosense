@@ -1,0 +1,484 @@
+//Pico med Lipo port
+//Set Lolin C3 pico 
+//Greenstick S1
+//Soilmoist
+
+// KOPPLA ur batteri när kod ska laddas upp
+// Lolin C3 Pico, AHT30 via I2C, Lipo. TSL2561
+//WIFI, PHP, Mysql, WM
+//temp, Humi, bat%. lux%
+//Get cfg from DB
+//Firmware uppdateras i db
+
+//2025 07 24
+
+
+#include <Wire.h>
+#include <SPI.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <ESPmDNS.h>
+#include <esp_wifi.h>  
+#include <ArduinoJson.h>
+#include <WiFiManager.h>
+#include <math.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_TSL2561_U.h>
+
+
+
+
+
+#include <Adafruit_AHTX0.h>
+Adafruit_AHTX0 aht;
+
+Adafruit_TSL2561_Unified tsl = Adafruit_TSL2561_Unified(TSL2561_ADDR_FLOAT, 12345);
+float lux = 0;
+
+
+
+int adc;
+float ldr = 0;
+int intervalMinutes = 60;
+float fVoltage = 0;
+float fmVoltage = 0;
+int perc = 0;
+String sensorLocation = ""; // MAC-adress utan kolon sätts senare
+int soilRaw = 0;
+
+
+// switch för I2C bus, bus vcc kopplad till PIN5
+
+#define VCC_I2C 5
+
+#define I2C_SDA 8
+#define I2C_SCL 10
+
+// === KONFIGURATION AV SOIL-MOISTURE ===
+// Pins
+const int pwmPin = 4;   // GPIO4
+const int adcPin = 0;   // GPIO0
+
+
+
+
+
+
+// v3.xx med TSL,  sw på i2c bus, soilsensor på pin4,5
+const String firmwareVersion = "3.2"; 
+
+
+
+
+// REPLACE with your Domain name and URL path or IP address with path
+const char* serverName = "https://monosense.se/insertdata.php";
+
+// Keep this API Key value to be compatible with the PHP code provided in the project page. 
+// If you change the apiKeyValue value, the PHP file /post-esp-data.php also needs to have the same key 
+String apiKeyValue = "xxxxx";
+String sensorName = "C3Pico-AHT30-TSL";
+String hostname = "";
+
+
+
+
+//Loop för att initiera I2C AHT30
+bool initAHTSensor(uint8_t retries = 10, uint16_t delayPerTryMs = 200) {
+  Serial.print("Initierar AHT... ");
+  for (uint8_t i = 0; i < retries; i++) {
+    if (aht.begin()) {
+      Serial.println("Ok");
+      return true;
+    }
+    Serial.print("."); // Visar bara en punkt per försök
+    delay(delayPerTryMs);
+  }
+
+  Serial.println("AHT hittades inte.");
+  return false;
+}
+
+
+
+
+void getconfig() {
+  String mac = WiFi.macAddress();
+  mac.replace(":", ""); // Ta bort kolon
+  String url = "https://monosense.se/get_params.php?sensor_mac=" + mac;
+
+  //Serial.println("Hämtar konfiguration från: " + url);
+
+  WiFiClientSecure client;
+  client.setInsecure();  // Inaktivera certifikatverifiering
+  HTTPClient https;
+
+  if (https.begin(client, url)) {
+    int httpCode = https.GET();
+    if (httpCode == 200) {
+      String payload = https.getString();
+      //Serial.println("Cfg från server: " + payload);
+
+      DynamicJsonDocument doc(1024);
+      DeserializationError error = deserializeJson(doc, payload);
+      if (!error) {
+        if (doc.containsKey("cfg_interval")) {
+          intervalMinutes = doc["cfg_interval"];
+          if (intervalMinutes < 1 || intervalMinutes > 1440) {
+            Serial.println("Ogiltigt cfg_interval, använder 60 som fallback");
+            intervalMinutes = 60;
+          }
+        } else {
+          Serial.println("cfg_interval saknas, använder 60 som fallback");
+          intervalMinutes = 60;
+        }
+      } else {
+        Serial.print("JSON-fel: ");
+        Serial.println(error.c_str());
+        intervalMinutes = 60;
+      }
+    } else {
+      Serial.print("HTTP-fel: ");
+      Serial.println(httpCode);
+      intervalMinutes = 60;
+    }
+    https.end();
+  } else {
+    Serial.println("Kunde inte ansluta till servern.");
+    intervalMinutes = 60;
+  }
+
+  
+  Serial.print("Konfiguration: interval satt till ");
+  Serial.print(intervalMinutes);
+  Serial.println(" minuter");
+}
+
+
+// === FUNKTION FÖR MÄTNING AV SOIL-MOISTURE RAW MED MEDELVÄRDE ===
+int measureSoilRaw() {
+
+ 
+  analogWrite(pwmPin, 128);  // Starta 50% duty PWM
+  delay(200);                // Låt spänningen stabiliseras
+
+ // === ADC flush ===
+  analogRead(adcPin);
+  delay(10);
+  int sum = 0;
+  const int numSamples = 5;
+
+  for (int i = 0; i < numSamples; i++) {
+    sum += analogRead(adcPin);
+    delay(500);               // Liten paus mellan mätningar
+  }
+
+  analogWrite(pwmPin, 0);    // Stäng av PWM
+
+  int value = sum / numSamples;  // Beräkna medelvärde
+  return value;
+}
+
+
+
+// == Read battery
+void readBattery() {
+  analogReadResolution(12);
+  analogRead(A3);  // dummy
+  delay(10);
+
+  int raw = analogRead(A3);
+  fVoltage = raw * 0.001391;
+  fmVoltage = fVoltage * 1000;
+
+  float fVoltageMatrix[22][2] = {
+    {4.17, 100}, {4.15, 95}, {4.11, 90}, {4.08, 85}, {4.02, 80},
+    {3.98, 75}, {3.95, 70}, {3.91, 65}, {3.87, 60}, {3.85, 55},
+    {3.84, 50}, {3.82, 45}, {3.80, 40}, {3.79, 35}, {3.77, 30},
+    {3.75, 25}, {3.73, 20}, {3.71, 15}, {3.69, 10}, {3.61, 5},
+    {3.27, 0},  {0, 0}
+  };
+
+  for (int i = 0; i < 21; i++) {
+    if (fVoltage >= fVoltageMatrix[i][0]) {
+      perc = fVoltageMatrix[i][1];  // ← uppdaterar globala perc!
+      return;
+    }
+  }
+
+  // Fallback om ingen match (väldigt låg spänning)
+  perc = 0;
+}
+
+
+// == I2Cbus on/off
+void i2coff() {
+  Wire.end();
+  digitalWrite(VCC_I2C, LOW);             // Stäng av sensorerna
+  pinMode(I2C_SDA, INPUT_PULLDOWN);        // Hindra krypström
+  pinMode(I2C_SCL, INPUT_PULLDOWN);
+}
+
+void i2con() {
+  digitalWrite(VCC_I2C, HIGH);            // Slå på sensorerna
+  delay(10);                               //10 ms
+  Wire.begin(I2C_SDA, I2C_SCL);            // Initiera I2C igen
+}
+
+// == Read LUX
+void readtsl(){
+  sensors_event_t lightEvent;
+tsl.getEvent(&lightEvent);
+lux = lightEvent.light;
+if (!isfinite(lux)) lux = 0;  // fallback om avläsning misslyckas
+
+
+}
+
+
+
+
+// === SETUP === //
+void setup() {
+  Serial.begin(115200);
+  Serial.println("═════════════════════════");
+  Serial.println("STARTUP Monosense device ");
+  Serial.println("═════════════════════════");
+  Serial.print("Monoware v");
+  Serial.println(firmwareVersion);
+
+                // I2C bus VCC on
+  delay(300);
+  pinMode(VCC_I2C, OUTPUT);
+  i2con();  //I2C initieras och VCC on
+  
+
+  if (!initAHTSensor(10, 200)) {
+  while (true) {
+    Serial.println("Kan inte initiera AHTsensor");
+    delay(5000);
+    }
+  }
+
+  Serial.print("Initierar TSL2561... ");
+if (!tsl.begin()) {
+  Serial.println("Kunde inte hitta TSL2561");
+} else {
+  Serial.println("Ok");
+  tsl.enableAutoRange(true);
+  tsl.setIntegrationTime(TSL2561_INTEGRATIONTIME_13MS);
+}
+
+  
+
+
+  // === Starta WiFiManager utan att ha byggt hostname än ===
+  WiFiManager wm;
+
+  // Försök ansluta automatiskt
+  if (!wm.autoConnect("Monosense-Setup")) {
+    Serial.println("Misslyckades att ansluta - startar om...");
+    delay(3000);
+    ESP.restart();
+  }
+
+  
+
+  // === Hämta MAC med det äldre sättet ===
+  String macStr = WiFi.macAddress();       // t.ex. "68:67:25:B1:F8"
+  String macStrNoColon = macStr;
+  macStrNoColon.replace(":", "");          // "686725B1F8"
+
+  // Skapa hostname baserat på MAC
+  String suffix = macStrNoColon.substring(8, 12); // sista 4 tecken
+  hostname = "Monosense-" + suffix;
+
+  Serial.print("Hostname: ");
+  Serial.println(hostname);
+  Serial.print("MAC: ");
+  Serial.println(macStr);
+
+  // === Starta mDNS så du kan nå http://Monosense-XXXX.local ===
+  if (MDNS.begin(hostname.c_str())) {
+    Serial.print("mDNS aktiv på: http://");
+    Serial.print(hostname);
+    Serial.println(".local");
+  } else {
+    Serial.println("mDNS start misslyckades");
+  }
+
+  delay(500);
+
+  // Hämta konfig från server
+  getconfig();
+
+
+
+ // Soilsensor input initi
+ 
+  analogWriteFrequency(pwmPin, 600000);
+  analogWriteResolution(pwmPin, 8); 
+  analogWrite(pwmPin, 0);  // säker PWM off från start
+
+  analogReadResolution(12);
+  analogSetPinAttenuation(A3, ADC_6db);   // batteri på GPIO3/A3
+  analogSetPinAttenuation(adcPin, ADC_11db);  // soil på GPIO0
+
+
+}
+
+
+// === LOOP === //
+void loop() {
+// Läser batteri och uppdaterar batteryVoltage & batteryPercent
+  readBattery();
+ 
+
+  Serial.println("I2C bus On, hämtar data... ");
+  i2con();
+  delay(500);
+
+// read lux
+  readtsl();
+
+//Read H & T AHT30
+
+  sensors_event_t humidity, temp;
+  aht.getEvent(&humidity, &temp);// populate temp and humidity objects with fresh data
+
+  // Kalibrering
+  float temp2 = temp.temperature - 2.0;
+  float humi = humidity.relative_humidity + 0;
+
+Serial.println("I2C bus Off ");
+i2coff();
+delay(500);
+
+//  Mäter markfuktighet
+   int soilRaw = measureSoilRaw();
+   //gör om till %, raw 0-4096
+   int soilPerc = map(soilRaw, 800, 3900, 100, 0);
+   soilPerc = constrain(soilPerc, 0, 100);
+
+
+//Read WIFI RSSI
+ long rssi = WiFi.RSSI();
+ int quality = 0;
+ 
+  // dBm to Quality %
+  if(rssi <= -100)
+    quality = 0;
+  else if(rssi >= -50)
+    quality = 100;
+  else
+    quality = 2 * (rssi + 100);
+
+//Get MACaddress
+uint8_t mac[6];
+esp_wifi_get_mac(WIFI_IF_STA, mac);
+
+sensorLocation = "";
+char buf[3];
+for (int i = 0; i < 6; i++) {
+  sprintf(buf, "%02X", mac[i]);  // versaler, utan kolon
+  sensorLocation += String(buf);
+}
+
+
+
+
+
+// print out value:
+  Serial.println("Sensordata-------------------------");
+    Serial.print("Temperature: "); Serial.print(temp2); Serial.println("°C");
+    Serial.print("Humidity: "); Serial.print(humi); Serial.println("% rH");
+    Serial.print("Battery: ");
+    Serial.print(fVoltage);
+    Serial.print("V");
+    Serial.print(" | ");
+    Serial.print(perc);
+    Serial.println("% ");
+    Serial.print("Wifi RSSI: ");
+    Serial.print(WiFi.RSSI());
+    Serial.print("dBm");
+    Serial.print(" | ");
+    Serial.print(quality);
+    Serial.println("%");
+    Serial.print("Ljus: ");
+    Serial.print(lux);
+    Serial.println("lux");
+    Serial.print("Markfuktighet: ");
+    Serial.print(soilRaw);
+    Serial.print(" | ");
+    Serial.print(soilPerc);
+    Serial.println("%");
+
+
+  // === API ===
+
+    //Check WiFi connection status
+  if(WiFi.status()== WL_CONNECTED){
+    WiFiClientSecure *client = new WiFiClientSecure;
+    client->setInsecure(); //don't use SSL certificate
+    HTTPClient https;
+    
+    // Your Domain name with URL path or IP address with path
+    https.begin(*client, serverName);
+    
+    // Specify content-type header
+    https.addHeader("Content-Type", "application/x-www-form-urlencoded");
+    
+    // Prepare your HTTP POST request data
+    String httpRequestData = "api_key=" + apiKeyValue +
+                         "&sensor_type=" + sensorName +
+                         "&sensor_mac=" + sensorLocation +
+                         "&value1=" + String(temp2, 2) +
+                         "&value2=" + String(humi, 2) +
+                         "&value4=" + String(perc) +
+                         "&value5=" + String(quality) +
+                         "&value8=" + String(fmVoltage, 2) +
+                         "&firmware_version=" + firmwareVersion +
+                         "&value9=" + String(lux, 2) +
+                         "&value10=" + String(soilRaw) +
+                         "";
+
+    Serial.println();                      
+    Serial.print("API reguest Url: ");
+    Serial.println(httpRequestData);
+
+
+    // Send HTTP POST request
+    int httpResponseCode = https.POST(httpRequestData);
+     
+
+    
+    if (httpResponseCode>0) {
+      Serial.print("API Response: ");
+      Serial.println(httpResponseCode);
+    }
+    else {
+      Serial.print("Error code: ");
+      Serial.println(httpResponseCode);
+    }
+    // Free resources
+    https.end();
+  }
+  else {
+    Serial.println("WiFi Disconnected");
+  }
+ 
+// DEEP SLEEP MODE
+
+  Serial.print("Energisparläge i ");
+  Serial.print(intervalMinutes);
+  Serial.println(" min.");
+  Serial.println("");
+  delay(1000);
+  // Gå till deep sleep i den definierade tidsperioden
+  uint64_t sleepTime = (uint64_t)intervalMinutes * 60ULL * 1000000ULL;
+  ESP.deepSleep(sleepTime);
+        
+ 
+
+  
+}
