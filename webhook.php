@@ -3,7 +3,7 @@
 include "db.php";
 
 // Definiera den tillåtna API-nyckeln
-$allowed_api_key = 'NfkoenKmg97m';
+$allowed_api_key = 'xxxxx';
 
 // Kontrollera om API-nyckel finns i headern och matchar den tillåtna nyckeln
 $headers = getallheaders();
@@ -120,3 +120,4 @@ function generatePin() {
     return rand(1000, 9999);
 }
 ?>
+
